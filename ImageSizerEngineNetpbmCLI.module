@@ -13,7 +13,7 @@ class ImageSizerEngineNetpbmCLI extends ImageSizerEngine implements Module, Conf
     public static function getModuleInfo() {
         return array(
             'title' => 'ImageSizerEngine NETPBM CLI',
-            'version' => 1,
+            'version' => 10,
             'summary' => "Upgrades image manipulations to use the CLI (exec) tools of NETPBM",
             'author' => 'Horst Nogajski',
             'autoload' => false,
