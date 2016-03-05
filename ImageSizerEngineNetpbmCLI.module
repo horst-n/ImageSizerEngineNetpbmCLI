@@ -1,0 +1,365 @@
+<?php namespace ProcessWire;
+
+/**
+ * ImageSizer Engine Netpbm
+ *
+ * Copyright (C) 2016 by Horst Nogajski
+ *
+ * @property string $netpbmPath Module configuration value
+ *
+ */
+class ImageSizerEngineNetpbmCLI extends ImageSizerEngine implements Module, ConfigurableModule {
+
+    public static function getModuleInfo() {
+        return array(
+            'title' => 'ImageSizerEngine NETPBM CLI',
+            'version' => 1,
+            'summary' => "Upgrades image manipulations to use the CLI (exec) tools of NETPBM",
+            'author' => 'Horst Nogajski',
+            'autoload' => false,
+            'singular' => false,
+        );
+    }
+
+    /**
+     * @var bool|null
+     */
+    static protected $supported = null;
+
+    /**
+     * @var string
+     */
+    protected $NETPBMPATH;
+
+    /**
+     * @var array, list of needed CLI progs for converting from / to different imageformats
+     */
+    protected $formatTools = array('pamtopnm', 'jpegtopnm', 'pngtopam', 'giftopnm', 'pnmtojpeg', 'pnmtopng', 'ppmtogif');
+
+    /**
+     * @var array, list of CLI progs needed for sharpening
+     */
+    protected $sharpenTools = array('pammasksharpen', 'pnmconvol', 'pamtopnm');
+
+    /**
+     * @var array, list of CLI progs needed for image manipulations
+     */
+    protected $manipulationTools = array('pamcut', 'pamscale', 'pamflip', 'pnmgamma');
+
+    /**
+     *  Construct
+     */
+    public function __construct() {
+        // the logfile will be used in debug mode only
+        $this->log = new FileLog(wire('config')->paths->logs . 'imagesizerengine-netpbm.txt');
+        // set a lower default quality of 80, which is more like 90 in GD
+        $this->setQuality(80);
+
+        $this->set('netpbmPath', '');
+        parent::__construct();
+    }
+
+    /**
+     * Get shell path
+     *
+     * @param string $path
+     * @return string mixed
+     *
+     */
+    protected static function shellpath($path, $isDir = true) {
+        if('/' != DIRECTORY_SEPARATOR) {
+            $path = str_replace('/', DIRECTORY_SEPARATOR, $path);
+        }
+        $path = rtrim($path, DIRECTORY_SEPARATOR) . ($isDir ? DIRECTORY_SEPARATOR : '');
+        return $path;
+    }
+
+    /**
+     * Prepend directory path and wrap doublequotes around the concatenated path
+     * for use in the CLI cmd string
+     *
+     * @param string $executable
+     * @return string mixed
+     *
+     */
+    protected function callExecutable($executable) {
+        return "\"{$this->NETPBMPATH}{$executable}\"";
+    }
+
+    /**
+     * Get valid source image formats
+     *
+     * @return array
+     *
+     */
+    protected function validSourceImageFormats() {
+        return array('JPG', 'JPEG');
+        #return array('PNG', 'JPG', 'JPEG', 'GIF');
+    }
+
+    /**
+     * Is this module supported for resizing images
+     *
+     * @param string $action
+     * @return bool|null
+     *
+     */
+    public function supported($action = '') {
+
+        if(self::$supported !== null) return self::$supported;
+
+        $config = $this->wire('config');
+        $debug = $config->debug || $action == 'install';
+
+        // config.netpbmPath overrides module configured netpbmPath
+        if($config->netpbmPath) $this->netpbmPath = $config->netpbmPath;
+
+        if(!$this->NETPBMPATH) {
+            if(!$this->netpbmPath) {
+                self::$supported = false;
+                return false;
+            }
+            $this->NETPBMPATH = self::shellpath($this->netpbmPath);
+        }
+
+        // for regular (production runtime) checks, we only look if the directory exists,
+        // but when installing the module, or accessing the config screen, we do a full check
+        $dirExists = is_dir($this->NETPBMPATH);
+        if('install' != $action) return $dirExists;
+
+        // full check:
+        $s = ini_get('disable_functions');
+        if($s) {
+            $a = explode(',', str_replace(' ', '', mb_strtolower($s)));
+            if(in_array('exec', $a)) {
+                if($debug) $this->warning(sprintf($this->_("%s - The PHP exec() function is not allowed!"), __CLASS__));
+                self::$supported = false;
+                return false;
+            }
+        }
+
+        $this->netpbmTools = $executables = array_merge($this->formatTools, $this->sharpenTools, $this->manipulationTools);
+        $res = true;
+        foreach($executables as $executable) {
+            if(!file_exists($this->NETPBMPATH . $executable) && !file_exists($this->NETPBMPATH . $executable . '.exe')) {
+                if($debug) $this->warning(sprintf($this->_("%s - Missing executable: %s"), __CLASS__, $executable));
+                self::$supported = false;
+                $res = false;
+            }
+        }
+        self::$supported = $res;
+
+        return $res;
+    }
+
+    /**
+     * Process the image resize
+     *
+     * @param string $srcFilename Source file
+     * @param string $dstFilename Destination file
+     * @param int $fullWidth Current width
+     * @param int $fullHeight Current height
+     * @param int $finalWidth Requested final width
+     * @param int $finalHeight Requested final height
+     * @return bool
+     * @throws WireException
+     *
+     */
+    protected function processResize($srcFilename, $dstFilename, $fullWidth, $fullHeight, $finalWidth, $finalHeight) {
+
+        $this->setTimeLimit(120);
+
+        $srcFilename = self::shellpath($srcFilename, false);
+        $dstFilename = self::shellpath($dstFilename, false);
+
+        @unlink($dstFilename);
+        @clearstatcache(dirname($dstFilename));
+
+        $intermediateFile = $dstFilename . '-image.ppm';
+
+        $this->modified = false;
+        $this->imageDepth = $this->info['bits'];
+        $this->imageFormat = strtoupper(str_replace('image/', '', $this->info['mime']));
+        if(!in_array($this->imageFormat, $this->validSourceImageFormats())) {
+            throw new WireException(sprintf($this->_("loaded file '%s' is not in the list of valid images", basename($dstFilename))));
+        }
+
+        switch($this->imageType) {
+            case \IMAGETYPE_JPEG:
+                $this->converterIn = 'jpegtopnm';
+                $this->converterOut = 'pnmtojpeg';
+                $this->converterInOptions = '-dct int -quiet'; // -dct int|fast, -nosmooth, -maxmemory N
+                $this->converterOutOptions = "-quality={$this->quality} -density=72x72dpi -quiet";
+                break;
+            case \IMAGETYPE_PNG:
+                $this->converterIn = 'pngtopam';
+                $this->converterOut = 'pamtopng';
+                $this->converterInOptions = '';
+                $this->converterOutOptions = '-compression=9 -comp_mem_level=5 -srgbintent=perceptual -gamma=.45';
+                if($this->hasAlphaChannel($srcFilename)) {
+                    $this->converterInOptions .= ' -alphapam';
+                    $this->converterOutOptions .= ''; // -alpha=filename
+                }
+                break;
+            case \IMAGETYPE_GIF:
+                $this->converterIn = 'giftopnm';
+                $this->converterOut = 'ppmtogif';
+                $this->converterInOptions = '';
+                $this->converterOutOptions = '';
+                break;
+        }
+        $converterIn           = $this->callExecutable($this->converterIn);  // imagetype to netpbm
+        $converterOut          = $this->callExecutable($this->converterOut); // netpbm to imagetype
+        $converterInOptions    = $this->converterInOptions;
+        $converterOutOptions   = $this->converterOutOptions;
+        $converterIntermediate = $this->callExecutable('pamtopnm'); // netpbm to netpbm
+
+        // we need to know if we can use -linear flag with pamscale!
+        $gammaLinearized = $gammaRestored = $linear = '';
+        if($this->defaultGamma && $this->defaultGamma != -1) {
+            $linear = ' -linear';
+            $gammaLinearized = $this->callExecutable('pnmgamma') . " -srgbramp";
+            $gammaRestored = $this->callExecutable('pnmgamma') . " -ungamma -srgbramp";
+        }
+        $tickets = array();
+        $orientations = null;
+        $needRotation = $this->autoRotation !== true ? false : ($this->checkOrientation($orientations) && (!empty($orientations[0]) || !empty($orientations[1])) ? true : false);
+        if($this->rotate || $this->flip || $needRotation) {
+            $degrees = $this->rotate ? $this->rotate : ((is_float($orientations[0]) || is_int($orientations[0])) && $orientations[0] > -361 && $orientations[0] < 361 ? $orientations[0] : false);
+            if($degrees !== false && in_array($degrees, array(90, 180, 270))) {
+                $tickets[] = $this->callExecutable('pamflip') . ' -r' . $degrees;
+                if(abs($degrees) == 90 || abs($degrees) == 270) {
+                    $this->setImageInfo($fullHeight, $fullWidth); // we have to swap width & height now!
+                }
+            }
+            if('v' == $this->flip || 2 == $orientations[1]) {
+                $tickets[] = $this->callExecutable('pamflip') . ' -tb'; // -topbottom
+            }
+            if('h' == $this->flip || 1 == $orientations[1]) {
+                $tickets[] = $this->callExecutable('pamflip') . ' -lr'; // -leftright
+            }
+        }
+        if(is_array($this->cropExtra) && 4 == count($this->cropExtra)) { // crop before resize
+            list($cropX, $cropY, $cropWidth, $cropHeight) = $this->cropExtra;
+             $tickets[] = $this->callExecutable('pamcut') . " -left=$cropX -top=$cropY -width=$cropWidth -height=$cropHeight";
+            $this->setImageInfo($cropWidth, $cropHeight);
+        }
+
+        $bgX = $bgY = 0;
+        $bgWidth = $fullWidth;
+        $bgHeight = $fullHeight;
+        $resizemethod = $this->getResizemethod($bgWidth, $bgHeight, $finalWidth, $finalHeight, $bgX, $bgY);
+        if(0 == $resizemethod) {
+            $this->sharpening = 'none';  // no need for sharpening because we use original copy without scaling
+            $this->setImageInfo($fullWidth, $fullHeight);
+        }
+        if(2 == $resizemethod) { // 2 = resize with aspect ratio
+            $tickets[] = $this->callExecutable('pamscale') . "{$linear} -width=$finalWidth -height=$finalHeight -quiet";
+            $this->setImageInfo($finalWidth, $finalHeight);
+        }
+        if(4 == $resizemethod) { // 4 = resize and crop from center with aspect ratio
+            $tickets[] = $this->callExecutable('pamscale') . "{$linear} -width=$bgWidth -height=$bgHeight -quiet";
+             $tickets[] = $this->callExecutable('pamcut') . " -left=$bgX -top=$bgY -width=$finalWidth -height=$finalHeight";
+            $this->setImageInfo($finalWidth, $finalHeight);
+        }
+
+        // EXECUTE
+        $ticket = 0 < count($tickets) ? implode(' | ', $tickets) : '';
+        if(\IMAGETYPE_JPEG == $this->imageType) {
+            $cmd = "$converterIn $converterInOptions \"$srcFilename\"";
+            if($ticket && $gammaLinearized) $cmd .= " | $gammaLinearized";
+            if($ticket) $cmd .= " | $ticket";
+            if($ticket && $gammaRestored) $cmd .= " | $gammaRestored";
+            if($this->sharpening && $this->sharpening != 'none') {
+                if($ticket) $cmd .= " | $converterIntermediate > \"$intermediateFile\"";
+            } else {
+                if($ticket) $cmd .= " | $converterOut $converterOutOptions > \"$dstFilename\"";
+            }
+        }
+        //if(\IMAGETYPE_PNG == $this->imageType) {
+        //    $cmd = "$converterIn -quiet \"$srcFilename\" $gammaLinearized | {$ticket} $gammaRestored | $converterOut -density=72x72dpi -quiet > \"$dstFilename\"";
+        //}
+        //if(\IMAGETYPE_GIF == $this->imageType) {
+        //    $cmd = "$converterIn -quiet \"$srcFilename\" $gammaLinearized | {$ticket} $gammaRestored | $converterOut -density=72x72dpi -quiet > \"$dstFilename\"";
+        //}
+        $out = array(); $ret = 0;
+        @exec($cmd, $out, $ret);
+        if(0 != $ret) {
+            if($this->config->debug) $this->log->save(sprintf($this->_("%s - CLI execution failed! [%d] (%s)"), __CLASS__, $ret, $cmd), notice::warning);
+            return false; // uhm, something went wrong
+        }
+        if($this->sharpening && $this->sharpening != 'none') {
+            $sharpenMatrixes = array(
+                'soft'   => array('.105,.105,.105;.105,.105,.105;.105,.105,.105', '.9', '1'),
+                'medium' => array('.108,.108,.108;.108,.108,.108;.108,.108,.108', '1.3', '.7'),
+                'strong' => array('.11,.11,.11;.11,.11,.11;.11,.11,.11', '1.9', '.5')
+            );
+            $matrix    = $sharpenMatrixes[$this->sharpening][0];  // -normalize -bias=n
+            $sharpness = $sharpenMatrixes[$this->sharpening][1];  // 0 = no sharpening | 1.0 is default | any none negativ number
+            $threshold = $sharpenMatrixes[$this->sharpening][2];  // 0.1 - 1.0
+            $maskFile  = $dstFilename . '-mask.ppm';
+            $out = array(); $ret = 0;
+            $cmd = "\"{$this->NETPBMPATH}pnmconvol\" -matrix=$matrix \"$intermediateFile\" > \"$maskFile\"";
+            @exec($cmd, $out, $ret);
+            if(file_exists($maskFile)) {
+                $out = array(); $ret = 0;
+                $cmd = "\"{$this->NETPBMPATH}pammasksharpen\" -sharpness=$sharpness -threshold=$threshold \"$maskFile\" \"$intermediateFile\" | $converterOut $converterOutOptions > \"$dstFilename\"";
+                @exec($cmd, $out, $ret);
+            }
+            foreach(array($intermediateFile, $maskFile) as $f) @unlink($f);
+        }
+
+        return true;
+    }
+
+    /**
+     * Return bool if corrrection of Orientation is needed
+     *
+     * @param array $correctionArray
+     * @return bool
+     *
+     */
+    protected function checkOrientation(&$correctionArray) {
+        if(true !== parent::checkOrientation($correctionArray)) return false;
+        // first value is rotation-degree and second value is flip-mode: 0=NONE | 1=HORIZONTAL | 2=VERTICAL
+        //$corrections = array(
+        //    '1' => array(  0, 0),
+        //    '2' => array(  0, 1),
+        //    '3' => array(180, 0),
+        //    '4' => array(  0, 2),
+        //    '5' => array(-270, 1),
+        //    '6' => array(-270, 0),
+        //    '7' => array( -90, 1),
+        //    '8' => array( -90, 0)
+        //    );
+        if(-90 == $correctionArray[0]) $correctionArray[0] = 90;
+        if(-270 == $correctionArray[0]) $correctionArray[0] = 270;
+        return true;
+    }
+
+    /**
+     * Configure module
+     *
+     * @param InputfieldWrapper $inputfields
+     *
+     */
+    public function getModuleConfigInputfields(InputfieldWrapper $inputfields) {
+
+        parent::getModuleConfigInputfields($inputfields);
+
+        if($this->wire('config')->netpbmPath) {
+            $this->netpbmPath = $this->wire('config')->netpbmPath;
+            $this->message('Netpbm path is defined in /site/config.php: $config->netpbmPath');
+        } else {
+            $f = $this->wire('modules')->get('InputfieldText');
+            $f->attr('name', 'netpbmPath');
+            $f->label = $this->_('Server path to the Netpbm CLI executables');
+            $f->attr('value', $this->netpbmPath);
+            $inputfields->add($f);
+        }
+
+        // report warnings if there are potential issues using ImageMagick CLI
+        if($this->netpbmPath) $this->supported('install');
+    }
+
+}
