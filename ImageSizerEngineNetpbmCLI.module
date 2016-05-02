@@ -18,6 +18,7 @@ class ImageSizerEngineNetpbmCLI extends ImageSizerEngine implements Module, Conf
             'author' => 'Horst Nogajski',
             'autoload' => false,
             'singular' => false,
+            'requires' => array('ProcessWire>=3.0.10')
         );
     }
 
